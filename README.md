@@ -123,6 +123,25 @@ for `turbulence`. The domain is a doubly periodic unit square. The run stops
 at `time.tlim` or the positive cycle limit `time.nlim`, whichever comes
 first. The output and checkpoint paths are relative to the working directory.
 
+### Snapshots during a run
+
+Set `snapshot_dt` in `[output]` to also save the state as the run evolves:
+
+```toml
+[output]
+file = "runs/driven_seed1618.npz"
+snapshot_dt = 1.0      # 0 (the default) saves only the final file
+```
+
+Snapshot `n` is written after the first step that reaches `n * snapshot_dt`,
+so it is at most one step late. Snapshots never shorten the timestep, and
+the evolution is bit-identical to a run without them. Only the last step is
+shortened, to end exactly at `tlim`, so the last snapshot is the final state.
+The files go to a folder named after the output file, for example
+`runs/driven_seed1618/snap.00000.npz`, `snap.00001.npz`, …, starting with
+the initial state. Each holds `dens`, `velx`, `vely` in `(ny, nx)` order and
+float64, cell centers `x` and `y`, and `time` and `cycle`.
+
 ## Use a learned SGS stress
 
 Supply a JAX predictor with `--sgs-model` and its checkpoint with

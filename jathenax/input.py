@@ -37,7 +37,8 @@ def read_input(path, problem=None):
         ),
         "hydro_srcterms": dict(drag_rate=0.3333335 if driven else 0.0),
         "sgs": dict(model="", weights=""),
-        "output": dict(file=filename),
+        # snapshot_dt = 0 writes no snapshots, only the final file.
+        "output": dict(file=filename, snapshot_dt=0.0),
     }
     if driven:
         settings["turb_driving"] = dict(

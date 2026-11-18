@@ -3,7 +3,7 @@
 import argparse
 from functools import partial
 from importlib import import_module
-from math import isfinite
+from math import floor, isfinite
 from pathlib import Path
 
 import jax
@@ -17,15 +17,31 @@ from .input import PROBLEMS, read_input
 from .initial_conditions import kelvin_helmholtz
 
 
+def initial_state(U, forcing=None):
+    """Solver state (U, time, previous dt, cycle, OU update, raw force) at t = 0."""
+    return (
+        U,
+        jnp.asarray(0.0, dtype=U.dtype),
+        jnp.asarray(jnp.inf, dtype=U.dtype),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(-1, dtype=jnp.int32),
+        jnp.zeros_like(U[..., 1:3]) if forcing is not None else None,
+    )
+
+
 @partial(jax.jit, static_argnames=(
     "integrator", "viscosity", "smagorinsky_cs", "drag_rate", "dt_update", "tdriv_start", "dedt",
     "reconstruct", "rsolver", "predict_stress",
 ))
-def evolve_isothermal(U, dx, dy, cs, dfloor, integrator, cfl, tlim, nlim, *,
-                      viscosity=0.0, smagorinsky_cs=0.0, drag_rate=0.0,
-                      forcing=None, dt_update=1.0, tdriv_start=0.0, dedt=0.0,
-                      reconstruct="ppm4", rsolver="roe", predict_stress=None, sgs_weights=None):
-    """Advance the device-resident periodic grid to the end time or step limit."""
+def advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tstop, nlim, *,
+                       viscosity=0.0, smagorinsky_cs=0.0, drag_rate=0.0,
+                       forcing=None, dt_update=1.0, tdriv_start=0.0, dedt=0.0,
+                       reconstruct="ppm4", rsolver="roe", predict_stress=None, sgs_weights=None):
+    """Advance a device-resident state until its time reaches tstop or tlim, or nlim cycles.
+
+    Only tlim shortens the last timestep. The loop just ends after the first step that
+    reaches tstop, so stopping at tstop and continuing gives the same evolution as one call.
+    """
     for name, value in (("viscosity", viscosity), ("smagorinsky_cs", smagorinsky_cs),
                         ("drag_rate", drag_rate), ("dedt", dedt)):
         if not isfinite(value) or value < 0.0:
@@ -35,7 +51,7 @@ def evolve_isothermal(U, dx, dy, cs, dfloor, integrator, cfl, tlim, nlim, *,
 
     def keep_going(state):
         _, time, _, cycle, _, _ = state
-        return (time < tlim) & (cycle < nlim)
+        return (time < tstop) & (time < tlim) & (cycle < nlim)
 
     def advance(state):
         U, time, previous_dt, cycle, update, raw_force = state
@@ -60,13 +76,23 @@ def evolve_isothermal(U, dx, dy, cs, dfloor, integrator, cfl, tlim, nlim, *,
         )
         return U, time + dt, dt, cycle + 1, update, raw_force
 
-    time = jnp.asarray(0.0, dtype=U.dtype)
-    previous_dt = jnp.asarray(jnp.inf, dtype=U.dtype)
-    cycle = jnp.asarray(0, dtype=jnp.int32)
-    update = jnp.asarray(-1, dtype=jnp.int32)
-    raw_force = jnp.zeros_like(U[..., 1:3]) if forcing is not None else None
-    state = (U, time, previous_dt, cycle, update, raw_force)
-    return jax.lax.while_loop(keep_going, advance, state)[:4]
+    return jax.lax.while_loop(keep_going, advance, state)
+
+
+def evolve_isothermal(U, dx, dy, cs, dfloor, integrator, cfl, tlim, nlim, **options):
+    """Advance the device-resident periodic grid from t = 0 to the end time or step limit."""
+    state = initial_state(U, options.get("forcing"))
+    return advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tlim, nlim,
+                              **options)[:4]
+
+
+def write_snapshot(path, U, x, y, time, cycle):
+    """Save density and velocity in float64, indexed [y, x], with the actual time and cycle."""
+    U = np.asarray(U, dtype=np.float64)
+    rho = U[..., 0]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, dens=rho, velx=U[..., 1] / rho, vely=U[..., 2] / rho,
+             x=x, y=y, time=time, cycle=cycle)
 
 
 if __name__ == "__main__":
@@ -129,6 +155,9 @@ if __name__ == "__main__":
     output = args.output or Path(settings["output"]["file"])
     if output.suffix != ".npz":
         parser.error("--output must end in .npz")
+    snapshot_dt = settings["output"]["snapshot_dt"]
+    if not isfinite(snapshot_dt) or snapshot_dt < 0:
+        parser.error("output.snapshot_dt must be finite and nonnegative")
 
     dx, dy = 1.0 / nx, 1.0 / ny
     x = (np.arange(nx) + 0.5) * dx - 0.5
@@ -168,13 +197,36 @@ if __name__ == "__main__":
         predict_stress = model.predict_stress
         sgs_weights = jax.device_put(model.load_weights(checkpoint), U_initial.device)
 
-    U, time, dt, cycle = jax.device_get(evolve_isothermal(
-        U_initial, dx, dy, cs, dfloor, integrator, cfl, tlim, nlim,
+    options = dict(
         viscosity=viscosity, smagorinsky_cs=smagorinsky_cs, drag_rate=drag_rate,
         forcing=forcing, dt_update=dt_update, tdriv_start=tdriv_start, dedt=dedt,
         reconstruct=reconstruct, rsolver=rsolver,
         predict_stress=predict_stress, sgs_weights=sgs_weights,
-    ))
+    )
+    state = initial_state(U_initial, forcing)
+    if snapshot_dt == 0:
+        state = advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tlim, nlim,
+                                   **options)
+    else:
+        # Snapshot n is due at n * snapshot_dt. It is written after the first step that reaches
+        # that time; the timestep is never shortened for it, so the evolution is unchanged.
+        # The tolerance lets round-off in n * snapshot_dt (e.g. 3 * 0.1) still count at tlim.
+        folder = output.with_suffix("")
+        tolerance = 4.0 * float(jnp.finfo(U_initial.dtype).eps)
+        n = 0
+        while True:
+            t, cycle = float(state[1]), int(state[3])     # state = (U, time, dt, cycle, ...)
+            if not isfinite(t):
+                raise RuntimeError(f"Periodic run reached a nonfinite time after {cycle} steps")
+            if t >= n * snapshot_dt * (1.0 - tolerance):
+                write_snapshot(folder / f"snap.{n:05d}.npz", jax.device_get(state[0]), x, y, t, cycle)
+                print(f"snapshot {n:05d} t={t:.8g} cycle={cycle}", flush=True)
+                n = max(n + 1, floor(t / snapshot_dt) + 1)
+            if t >= tlim or cycle >= nlim:
+                break
+            state = advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl,
+                                       tlim, min(tlim, n * snapshot_dt), nlim, **options)
+    U, time, dt, cycle = jax.device_get(state[:4])
     reached_tlim = time == np.asarray(tlim, dtype=time.dtype)
     if not np.isfinite(U).all() or not np.isfinite(time) or (not reached_tlim and cycle != nlim):
         raise RuntimeError(f"Periodic run ended at t={time} after {cycle} steps")

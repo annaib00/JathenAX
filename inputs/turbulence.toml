@@ -43,3 +43,4 @@ max_ky = 5
 
 [output]
 file = "runs/driven_seed1618.npz"
+snapshot_dt = 0.0     # > 0 also saves snapshots to runs/driven_seed1618/snap.NNNNN.npz
