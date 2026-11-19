@@ -5,6 +5,7 @@ from functools import partial
 from importlib import import_module
 from math import floor, isfinite
 from pathlib import Path
+from time import perf_counter
 
 import jax
 import jax.numpy as jnp
@@ -204,6 +205,10 @@ if __name__ == "__main__":
         predict_stress=predict_stress, sgs_weights=sgs_weights,
     )
     state = initial_state(U_initial, forcing)
+    # Wall time of the evolution, from the first step to the final state on the host. It includes
+    # JIT compilation of the first call; snapshot writing is timed separately.
+    wall_start = perf_counter()
+    snapshot_seconds = 0.0
     if snapshot_dt == 0:
         state = advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tlim, nlim,
                                    **options)
@@ -219,7 +224,9 @@ if __name__ == "__main__":
             if not isfinite(t):
                 raise RuntimeError(f"Periodic run reached a nonfinite time after {cycle} steps")
             if t >= n * snapshot_dt * (1.0 - tolerance):
+                write_start = perf_counter()
                 write_snapshot(folder / f"snap.{n:05d}.npz", jax.device_get(state[0]), x, y, t, cycle)
+                snapshot_seconds += perf_counter() - write_start
                 print(f"snapshot {n:05d} t={t:.8g} cycle={cycle}", flush=True)
                 n = max(n + 1, floor(t / snapshot_dt) + 1)
             if t >= tlim or cycle >= nlim:
@@ -227,6 +234,7 @@ if __name__ == "__main__":
             state = advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl,
                                        tlim, min(tlim, n * snapshot_dt), nlim, **options)
     U, time, dt, cycle = jax.device_get(state[:4])
+    wall_seconds = perf_counter() - wall_start
     reached_tlim = time == np.asarray(tlim, dtype=time.dtype)
     if not np.isfinite(U).all() or not np.isfinite(time) or (not reached_tlim and cycle != nlim):
         raise RuntimeError(f"Periodic run ended at t={time} after {cycle} steps")
@@ -234,7 +242,8 @@ if __name__ == "__main__":
     initial = np.asarray(U_initial)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(output, x=x, y=y, initial=initial, conserved=U, time=time, dt=dt, cycle=cycle,
-             problem=problem, sgs_model=model_name)
+             problem=problem, sgs_model=model_name,
+             wall_seconds=wall_seconds, snapshot_seconds=snapshot_seconds)
     drift = (U.sum(axis=(0, 1), dtype=np.float64)
              - initial.sum(axis=(0, 1), dtype=np.float64)) * dx * dy
     print(f"{integrator.upper()} on {U_initial.device}, {U.dtype}, {cycle} steps to t={time:.6g}")
@@ -244,4 +253,6 @@ if __name__ == "__main__":
     print(f"Change in box mass and momenta {drift[:3]}")
     if U.shape[-1] > 3:
         print(f"Change in integrated tracer {drift[3:]}")
+    print(f"Wall time {wall_seconds:.2f} s: time stepping {wall_seconds - snapshot_seconds:.2f} s "
+          f"(including JIT compilation), writing snapshots {snapshot_seconds:.2f} s")
     print(output.resolve())
