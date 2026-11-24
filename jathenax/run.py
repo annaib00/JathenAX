@@ -157,8 +157,6 @@ if __name__ == "__main__":
     if output.suffix != ".npz":
         parser.error("--output must end in .npz")
     snapshot_dt = settings["output"]["snapshot_dt"]
-    if not isfinite(snapshot_dt) or snapshot_dt < 0:
-        parser.error("output.snapshot_dt must be finite and nonnegative")
 
     dx, dy = 1.0 / nx, 1.0 / ny
     x = (np.arange(nx) + 0.5) * dx - 0.5
@@ -213,17 +211,13 @@ if __name__ == "__main__":
         state = advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tlim, nlim,
                                    **options)
     else:
-        # Snapshot n is due at n * snapshot_dt. It is written after the first step that reaches
-        # that time; the timestep is never shortened for it, so the evolution is unchanged.
-        # The tolerance lets round-off in n * snapshot_dt (e.g. 3 * 0.1) still count at tlim.
+        # Snapshot n is written after the first step that reaches min(tlim, n * snapshot_dt);
+        # the timestep is never shortened for it, so the evolution is unchanged.
         folder = output.with_suffix("")
-        tolerance = 4.0 * float(jnp.finfo(U_initial.dtype).eps)
         n = 0
         while True:
             t, cycle = float(state[1]), int(state[3])     # state = (U, time, dt, cycle, ...)
-            if not isfinite(t):
-                raise RuntimeError(f"Periodic run reached a nonfinite time after {cycle} steps")
-            if t >= n * snapshot_dt * (1.0 - tolerance):
+            if t >= min(tlim, n * snapshot_dt):
                 write_start = perf_counter()
                 write_snapshot(folder / f"snap.{n:05d}.npz", jax.device_get(state[0]), x, y, t, cycle)
                 snapshot_seconds += perf_counter() - write_start
