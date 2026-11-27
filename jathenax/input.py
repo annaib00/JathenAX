@@ -36,7 +36,8 @@ def read_input(path, problem=None):
             viscosity=1.5e-6 if driven else 0.0, smagorinsky_cs=0.0,
         ),
         "hydro_srcterms": dict(drag_rate=0.3333335 if driven else 0.0),
-        "sgs": dict(model="", weights=""),
+        # seed: PRNG seed of a stochastic SGS model's noise, split into one key per timestep.
+        "sgs": dict(model="", weights="", seed=0),
         # snapshot_dt = 0 writes no snapshots, only the final file.
         "output": dict(file=filename, snapshot_dt=0.0),
     }

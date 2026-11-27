@@ -1,6 +1,7 @@
 """Run a periodic isothermal example on the selected JAX device."""
 
 import argparse
+import inspect
 from functools import partial
 from importlib import import_module
 from math import floor, isfinite
@@ -18,8 +19,11 @@ from .input import PROBLEMS, read_input
 from .initial_conditions import kelvin_helmholtz
 
 
-def initial_state(U, forcing=None):
-    """Solver state (U, time, previous dt, cycle, OU update, raw force) at t = 0."""
+def initial_state(U, forcing=None, sgs_key=None):
+    """Solver state (U, time, previous dt, cycle, OU update, raw force, SGS key) at t = 0.
+
+    sgs_key is None for a deterministic SGS model; otherwise it is split once per step.
+    """
     return (
         U,
         jnp.asarray(0.0, dtype=U.dtype),
@@ -27,6 +31,7 @@ def initial_state(U, forcing=None):
         jnp.asarray(0, dtype=jnp.int32),
         jnp.asarray(-1, dtype=jnp.int32),
         jnp.zeros_like(U[..., 1:3]) if forcing is not None else None,
+        sgs_key,
     )
 
 
@@ -51,11 +56,14 @@ def advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tstop, 
         raise ValueError("dt_update must be finite and positive and tdriv_start finite")
 
     def keep_going(state):
-        _, time, _, cycle, _, _ = state
+        _, time, _, cycle, _, _, _ = state
         return (time < tstop) & (time < tlim) & (cycle < nlim)
 
     def advance(state):
-        U, time, previous_dt, cycle, update, raw_force = state
+        U, time, previous_dt, cycle, update, raw_force, key = state
+        step_key = None
+        if key is not None:
+            key, step_key = jax.random.split(key)
         _, W = recover_isothermal(U, dfloor)
         dt = isothermal_timestep(
             W, dx, dy, cs, cfl, previous_dt, time, tlim,
@@ -73,16 +81,16 @@ def advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tstop, 
             viscosity=viscosity, smagorinsky_cs=smagorinsky_cs, drag_rate=drag_rate,
             raw_force=raw_force, dedt=power,
             reconstruct=reconstruct, rsolver=rsolver,
-            predict_stress=predict_stress, sgs_weights=sgs_weights,
+            predict_stress=predict_stress, sgs_weights=sgs_weights, sgs_key=step_key,
         )
-        return U, time + dt, dt, cycle + 1, update, raw_force
+        return U, time + dt, dt, cycle + 1, update, raw_force, key
 
     return jax.lax.while_loop(keep_going, advance, state)
 
 
-def evolve_isothermal(U, dx, dy, cs, dfloor, integrator, cfl, tlim, nlim, **options):
+def evolve_isothermal(U, dx, dy, cs, dfloor, integrator, cfl, tlim, nlim, sgs_key=None, **options):
     """Advance the device-resident periodic grid from t = 0 to the end time or step limit."""
-    state = initial_state(U, options.get("forcing"))
+    state = initial_state(U, options.get("forcing"), sgs_key)
     return advance_isothermal(state, dx, dy, cs, dfloor, integrator, cfl, tlim, tlim, nlim,
                               **options)[:4]
 
@@ -190,11 +198,14 @@ if __name__ == "__main__":
         vy = 0.2 * np.sin(phase_x)
         U_initial = jax.device_put(np.stack((rho, rho * vx, rho * vy), axis=-1))
 
-    predict_stress, sgs_weights = None, None
+    predict_stress, sgs_weights, sgs_key = None, None, None
     if model_name:
         model = import_module(model_name)
         predict_stress = model.predict_stress
         sgs_weights = jax.device_put(model.load_weights(checkpoint), U_initial.device)
+        # A stochastic model takes predict_stress(weights, primitives, key): seed its noise from sgs.seed.
+        if len(inspect.signature(predict_stress).parameters) == 3:
+            sgs_key = jax.random.PRNGKey(settings["sgs"]["seed"])
 
     options = dict(
         viscosity=viscosity, smagorinsky_cs=smagorinsky_cs, drag_rate=drag_rate,
@@ -202,7 +213,7 @@ if __name__ == "__main__":
         reconstruct=reconstruct, rsolver=rsolver,
         predict_stress=predict_stress, sgs_weights=sgs_weights,
     )
-    state = initial_state(U_initial, forcing)
+    state = initial_state(U_initial, forcing, sgs_key)
     # Wall time of the evolution, from the first step to the final state on the host. It includes
     # JIT compilation of the first call; snapshot writing is timed separately.
     wall_start = perf_counter()
